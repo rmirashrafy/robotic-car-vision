@@ -4,18 +4,23 @@ import time
 import math
 import serial
 from picamera2 import Picamera2
+'''
+raw_size = (3200, 2400)
+crop_params = (120,2400, 2800, 1000)  # (x, y, w, h)
+output_size = (800, 600)
+'''
 
 raw_size = (3200, 2400)
-crop_params = (20, 1208, 3200, 1200)  # (x, y, w, h)
+crop_params = (120,2400, 2800, 1000)  # (x, y, w, h)
 output_size = (800, 600)
 
-Kp = 0.4
+Kp = 0.7
 Ki = 0.0
 Kd = 0.0
 prev_error = 0
 integral = 0
 
-motor_speed = 80      # مقدار سرعت موتور (0 تا 255)
+motor_speed = 110    # مقدار سرعت موتور (0 تا 255)
 move_command = 'F' 
 
 # اتصال به آردوینو
@@ -45,7 +50,7 @@ picam2 = Picamera2()
 config = picam2.create_preview_configuration(
 main={"size": output_size, "format": "RGB888"},
 raw={"size": raw_size},
-controls={"ScalerCrop": crop_params, "FrameRate": 10})
+controls={"ScalerCrop": crop_params, "FrameRate": 15})
 picam2.configure(config)
 picam2.start()
 cv2.namedWindow("window", cv2.WINDOW_NORMAL)
@@ -152,15 +157,17 @@ def find_the_4_lines_with_closest_slope(lines):
 
     return best_group
 
-
+last_left_lines = [0,0,0,0]
+last_right_lines = [0,0,0,0]
 def Line_Detection(img):
+    global last_left_lines, last_right_lines
     k=False
     
     height, width = img.shape[:2]
     
     
     mask = np.zeros_like(img)
-    polygon = np.array([[ (50, 500), (750,500), (360 , 50), (360, 50 )]], np.int32)
+    polygon = np.array([[ (50, 370), (750,370), (500 , 0), (300, 0 )]], np.int32)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)  # Apply Gaussian Blur to reduce noise
     mask = np.zeros_like(blur) 
@@ -169,9 +176,10 @@ def Line_Detection(img):
     edges = cv2.Canny(blur, 50, 150)
     edges = cv2.bitwise_and(edges, mask)  # Apply the mask to the image
     cv2.polylines(img, [polygon], isClosed=True, color=(0, 0, 0), thickness=2)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=40, maxLineGap=100)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=10, maxLineGap=100)
 
     left_lines, right_lines = [], []
+    
     if lines is not None:
         
         #lines = find_the_4_lines_with_closest_slope(lines)
@@ -182,14 +190,23 @@ def Line_Detection(img):
         for line in lines:
             
             x1, y1, x2, y2 = line[0]
+            
             slope=abs((y2-y1)//(x2-x1))
             #arz = x2 - x1
             if x1 < width // 2 and x2 < width // 2 and (slope>2):
                 left_lines.append(line)
+                
                 cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            elif x1 > width // 2 and x2 > width // 2 and (slope>5):
+            if x1 > width // 2 and x2 > width // 2 and (slope>2):
                 cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 right_lines.append(line)
+                
+        last_right_lines=right_lines
+        last_left_lines=left_lines
+    else:
+        # Use last detected lines if no current ones are found
+        left_lines = last_left_lines
+        right_lines = last_right_lines
 
     def average_line(lines):
         
@@ -217,7 +234,7 @@ def Line_Detection(img):
         left_center = ((avg_left_line[0][0] + avg_left_line[0][2]) // 2, (avg_left_line[0][1] + avg_left_line[0][3]) // 2)
         right_center = ((avg_right_line[0][0] + avg_right_line[0][2]) // 2, (avg_right_line[0][1] + avg_right_line[0][3]) // 2)
         center_point = ((left_center[0] + right_center[0]) // 2, (left_center[1] + right_center[1]) // 2)
-
+    
     elif avg_right_line:
         #center_point = ((avg_right_line[0][0] + avg_right_line[0][2]) // 2, (avg_right_line[0][1] + avg_right_line[0][3]) // 2)
         center_point = None
@@ -226,12 +243,13 @@ def Line_Detection(img):
         center_point = None#-----------------------------------------------------
     
     if k :
-            servo_angle=10
+            servo_angle=30
             print("LK")
             k=False
             return servo_angle
-
-            
+    
+    print(right_lines)
+    print(left_lines )
     if center_point :
         cv2.circle(img, center_point, 5, (0, 255, 0), 100)
         
@@ -263,7 +281,7 @@ while True:
     image = picam2.capture_array()
     image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) 
     image = cv2.rotate(image, cv2.ROTATE_180)
-    image = reduce_local_brightness(image, threshold=1, gamma=1.5, kernel_size=10)
+    image = reduce_local_brightness(image, threshold=1, gamma=1, kernel_size=10)
     #gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     frame = image
