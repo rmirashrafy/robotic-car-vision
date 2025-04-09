@@ -20,7 +20,7 @@ Kd = 0.0
 prev_error = 0
 integral = 0
 
-motor_speed = 110    # مقدار سرعت موتور (0 تا 255)
+motor_speed = 100    # مقدار سرعت موتور (0 تا 255)
 move_command = 'F' 
 
 # اتصال به آردوینو
@@ -50,7 +50,7 @@ picam2 = Picamera2()
 config = picam2.create_preview_configuration(
 main={"size": output_size, "format": "RGB888"},
 raw={"size": raw_size},
-controls={"ScalerCrop": crop_params, "FrameRate": 15})
+controls={"ScalerCrop": crop_params, "FrameRate": 30})
 picam2.configure(config)
 picam2.start()
 cv2.namedWindow("window", cv2.WINDOW_NORMAL)
@@ -157,8 +157,9 @@ def find_the_4_lines_with_closest_slope(lines):
 
     return best_group
 
-last_left_lines = [0,0,0,0]
-last_right_lines = [0,0,0,0]
+last_left_lines = np.array([0, 0, 0, 0])
+last_right_lines = np.array([0, 0, 0, 0])
+
 def Line_Detection(img):
     global last_left_lines, last_right_lines
     k=False
@@ -201,8 +202,15 @@ def Line_Detection(img):
                 cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 right_lines.append(line)
                 
-        last_right_lines=right_lines
-        last_left_lines=left_lines
+        
+        
+        if len(left_lines)==0:
+            left_lines = last_left_lines
+        if len(right_lines)==0:
+            right_lines = last_right_lines
+        else:
+            last_right_lines=right_lines
+            last_left_lines=left_lines
     else:
         # Use last detected lines if no current ones are found
         left_lines = last_left_lines
@@ -228,6 +236,9 @@ def Line_Detection(img):
     if avg_right_line:
         x1, y1, x2, y2 = avg_right_line[0]
         cv2.line(img, (x1, y1), (x2, y2), (0, 0, 255), 30)
+    
+        print(right_lines)
+        print(left_lines )
 
     # نقطه میانی مسیر
     if avg_left_line and avg_right_line:
@@ -248,8 +259,7 @@ def Line_Detection(img):
             k=False
             return servo_angle
     
-    print(right_lines)
-    print(left_lines )
+
     if center_point :
         cv2.circle(img, center_point, 5, (0, 255, 0), 100)
         
