@@ -1,3 +1,6 @@
+
+
+
 import cv2
 import numpy as np
 import time
@@ -14,13 +17,14 @@ raw_size = (3200, 2400)
 crop_params = (120,2400, 2800, 1000)  # (x, y, w, h)
 output_size = (800, 600)
 
-Kp = 0.7
+
+Kp=0.7
 Ki = 0.0
 Kd = 0.0
 prev_error = 0
 integral = 0
 
-motor_speed = 100    # مقدار سرعت موتور (0 تا 255)
+motor_speed = 96 # مقدار سرعت موتور (0 تا 255)
 move_command = 'F' 
 
 # اتصال به آردوینو
@@ -28,7 +32,7 @@ try:
     arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
     time.sleep(2)  # صبر برای راه‌اندازی کامل آردوینو
 except Exception as e:
-    print(f"Error: Could not connect to Arduino: {e}")
+    #print(f"Error: Could not connect to Arduino: {e}")
     exit()
     
 
@@ -36,10 +40,9 @@ def send_command(command):
     try:
         command += '\n'  # اضافه کردن کاراکتر newline برای تکمیل دستور
         arduino.write(command.encode())
-        print(f"Sent: {command.strip()}")
+        #print(f"Sent: {command.strip()}")
     except Exception as e:
         print(f"Error: Failed to send command: {e}")
-
     # ارسال دستور تنظیم سرعت موتور
 send_command(str(motor_speed))
 time.sleep(2)
@@ -53,18 +56,17 @@ raw={"size": raw_size},
 controls={"ScalerCrop": crop_params, "FrameRate": 30})
 picam2.configure(config)
 picam2.start()
-cv2.namedWindow("window", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("window", 640, 480 )   
 
-cv2.namedWindow("line detection", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("line detection", 640, 480)
+#cv2.namedWindow("window", cv2.WINDOW_NORMAL)
+#cv2.resizeWindow("window", 640, 480 )   
 #cv2.namedWindow("Original Video", cv2.WINDOW_NORMAL)
 #cv2.resizeWindow("Original Video", 640, 480)
 
-src_points = np.array([[0, 2400], [3200, 2400], [3200, 1000], [0, 1000]], dtype=np.float32)
-width, height = 920, 700
-dst_points = np.array([[0, height], [width, height], [width, 0], [0, 0]], dtype=np.float32)
-matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+cv2.namedWindow("line detection", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("line detection", 640, 480)
+
+
+
 
 def find_white_mean_x(image):
     # Load the image
@@ -109,9 +111,19 @@ def reduce_local_brightness(image, threshold=1, gamma=1.0, kernel_size=10):
     v_adjusted[bright_mask == 255] = v_gamma[bright_mask == 255]
     hsv_adjusted = cv2.merge([h, s, v_adjusted])
     return cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
+#global min_=-1000
+#global max_=0
 
 def pid_control(error):
-    print(f'error: {error}')
+    global Kp
+    print(f'error: {error},kp: {Kp}')
+    #print(f'min: {min_}, max:{max_}')
+    if abs(error)>70:
+        Kp=0.7
+    else:
+        Kp=0.5
+
+
     global prev_error, integral
     integral += error
     derivative = error - prev_error
@@ -157,8 +169,33 @@ def find_the_4_lines_with_closest_slope(lines):
 
     return best_group
 
-last_left_lines = np.array([0, 0, 0, 0])
-last_right_lines = np.array([0, 0, 0, 0])
+last_left_lines = np.array([[0, 0, 0, 0]])
+last_right_lines = np.array([[0, 0, 0, 0]])
+
+def black_noise(image):
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # --- Detect high contrast regions using Laplacian ---
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    laplacian_abs = np.uint8(np.absolute(laplacian))
+
+    # --- Threshold to detect sharp contrast (glare/high reflectivity) ---
+    _, high_contrast_mask = cv2.threshold(laplacian_abs, 40, 255, cv2.THRESH_BINARY)
+
+    # --- Optional: clean mask (remove noise) ---
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    high_contrast_mask = cv2.dilate(high_contrast_mask, kernel, iterations=1)
+    high_contrast_mask = cv2.erode(high_contrast_mask, kernel, iterations=1)
+
+    # --- Step 1: Make glare/contrast regions black in the original image ---
+    image_masked = image#.copy()
+    image_masked[high_contrast_mask == 255] = [0, 0, 0]  # Set white mask pixels to black
+
+    # --- Step 2: Inpaint the black areas using original mask ---
+    inpainted = cv2.inpaint(image_masked, high_contrast_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+
+    return inpainted
 
 def Line_Detection(img):
     global last_left_lines, last_right_lines
@@ -168,7 +205,7 @@ def Line_Detection(img):
     
     
     mask = np.zeros_like(img)
-    polygon = np.array([[ (50, 370), (750,370), (500 , 0), (300, 0 )]], np.int32)
+    polygon = np.array([[ (110, 500), (730,500), (730 , 50), (110, 50 )]], np.int32)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)  # Apply Gaussian Blur to reduce noise
     mask = np.zeros_like(blur) 
@@ -177,7 +214,7 @@ def Line_Detection(img):
     edges = cv2.Canny(blur, 50, 150)
     edges = cv2.bitwise_and(edges, mask)  # Apply the mask to the image
     cv2.polylines(img, [polygon], isClosed=True, color=(0, 0, 0), thickness=2)
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=10, maxLineGap=100)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=100, maxLineGap=100)
 
     left_lines, right_lines = [], []
     
@@ -237,8 +274,8 @@ def Line_Detection(img):
         x1, y1, x2, y2 = avg_right_line[0]
         cv2.line(img, (x1, y1), (x2, y2), (0, 0, 255), 30)
     
-        print(right_lines)
-        print(left_lines )
+        #print(right_lines)
+        #print(left_lines )
 
     # نقطه میانی مسیر
     if avg_left_line and avg_right_line:
@@ -255,7 +292,7 @@ def Line_Detection(img):
     
     if k :
             servo_angle=30
-            print("LK")
+            #print("LK")
             k=False
             return servo_angle
     
@@ -273,7 +310,7 @@ def Line_Detection(img):
         #print(f"error: {error}")
         
         steering_angle = int(np.clip(pid_control(error), -100, 100))
-        print(f'Steering Angle: {steering_angle}')
+        #print(f'Steering Angle: {steering_angle}')
         steering_angle = ((steering_angle*1.1)+110)
         if steering_angle==0:
            steering_angle = 50
@@ -288,27 +325,20 @@ def Line_Detection(img):
 
 
 while True:
-    image = picam2.capture_array()
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) 
-    image = cv2.rotate(image, cv2.ROTATE_180)
-    image = reduce_local_brightness(image, threshold=1, gamma=1, kernel_size=10)
-    #gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    frame = picam2.capture_array()
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) 
+    frame = cv2.rotate(frame, cv2.ROTATE_180)
+    frame = reduce_local_brightness(frame, threshold=1, gamma=1.5, kernel_size=10)
+    frame = black_noise(frame)
 
-    frame = image
-    #frame = cv2.warpPerspective(image, matrix, (width, height))
-    for point in src_points:
-      cv2.circle(image, tuple(point.astype(int)), 5, (0, 0, 255), -1)
-    cv2.polylines(image, [src_points.astype(int)], isClosed=True, color=(0, 255, 0), thickness=2)
-    #frame = reduce_local_brightness(warped) 
 
-    #Line_Detection(frame)  
+    
     servo_angle = 45  # مقدار پیش‌فرض در صورت عدم تشخیص خط
     temp_angle = Line_Detection(frame)
     if temp_angle is not None:
       servo_angle = temp_angle
       send_command(f"A{servo_angle}")
-    cv2.imshow('line detection', frame)  
-    #cv2.imshow('Original Video', image)
+      cv2.imshow('line detection', frame)  
     if cv2.waitKey(1) & 0xFF == ord('q'):
         
         move_command = 'S'
