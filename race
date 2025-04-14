@@ -1,0 +1,391 @@
+
+import cv2
+import numpy as np
+import time
+import math
+import serial
+from picamera2 import Picamera2
+
+aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+aruco_params = cv2.aruco.DetectorParameters()
+raw_size = (3200, 2400)
+crop_params = (120, 2400, 2800, 1000)  # (x, y, w, h)
+output_size = (800, 600)
+
+Kp = 0.4
+Ki = 0.0
+Kd = 0.0
+prev_error = 0
+integral = 0
+
+motor_speed = 90
+move_command = 'F'
+
+# اتصال به آردوینو
+try:
+    arduino = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+    time.sleep(2)
+except Exception as e:
+    print(f"Error: Could not connect to Arduino: {e}")
+    exit()
+
+def send_command(command):
+    try:
+        command += '\n'
+        arduino.write(command.encode())
+        print(f"Sent: {command.strip()}")
+    except Exception as e:
+        print(f"Error: Failed to send command: {e}")
+
+send_command(str(motor_speed))
+time.sleep(1)
+send_command(move_command)
+time.sleep(1)
+
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"size": output_size, "format": "RGB888"},
+    raw={"size": raw_size},
+    controls={"ScalerCrop": crop_params, "FrameRate": 15}
+)
+picam2.configure(config)
+picam2.start()
+
+cv2.namedWindow("window", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("window", 640, 480)
+cv2.namedWindow("line detection", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("line detection", 640, 480)
+
+src_points = np.array([[0, 2400], [3200, 2400], [3200, 1000], [0, 1000]], dtype=np.float32)
+width, height = 920, 700
+dst_points = np.array([[0, height], [width, height], [width, 0], [0, 0]], dtype=np.float32)
+matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+
+def find_white_mean_x(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    #hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    _, binary = cv2.threshold(gray, 100, 160, cv2.THRESH_BINARY)
+    lower_red = np.array(150)
+    upper_red = np.array(150)
+    mask = cv2.inRange(gray, lower_red, upper_red)
+    red_pixels = np.column_stack(np.where(mask > 0))
+    cv2.imshow('line detectionnn', mask)
+    
+    if red_pixels.size == 0:
+        return 1000
+    return red_pixels.size
+
+def black_noise(image):
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # --- Detect high contrast regions using Laplacian ---
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    laplacian_abs = np.uint8(np.absolute(laplacian))
+
+    # --- Threshold to detect sharp contrast (glare/high reflectivity) ---
+    _, high_contrast_mask = cv2.threshold(laplacian_abs, 40, 255, cv2.THRESH_BINARY)
+
+    # --- Optional: clean mask (remove noise) ---
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    high_contrast_mask = cv2.dilate(high_contrast_mask, kernel, iterations=1)
+    high_contrast_mask = cv2.erode(high_contrast_mask, kernel, iterations=1)
+
+    # --- Step 1: Make glare/contrast regions black in the original image ---
+    image_masked = image#.copy()
+    image_masked[high_contrast_mask == 255] = [0, 0, 0]  # Set white mask pixels to black
+
+    # --- Step 2: Inpaint the black areas using original mask ---
+    inpainted = cv2.inpaint(image_masked, high_contrast_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+
+    return inpainted
+
+def reduce_local_brightness(image, threshold=1, gamma=1.0, kernel_size=10):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    _, bright_mask = cv2.threshold(v, threshold, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, kernel)
+    v_norm = v / 255.0
+    v_gamma = np.power(v_norm, gamma)
+    v_gamma = np.uint8(v_gamma * 255)
+    v_adjusted = v.copy()
+    v_adjusted[bright_mask == 255] = v_gamma[bright_mask == 255]
+    hsv_adjusted = cv2.merge([h, s, v_adjusted])
+    return cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2BGR)
+
+def pid_control(error):
+    global prev_error, integral
+    print(f'error: {error}')
+    integral += error
+    derivative = error - prev_error
+    prev_error = error
+    control = Kp * error + Ki * integral + Kd * derivative
+    return control
+
+def compute_slope(x1, y1, x2, y2):
+    if x2 - x1 == 0:
+        return float('inf')
+    return (y2 - y1) / (x2 - x1)
+
+def find_the_4_lines_with_closest_slope(lines):
+    lines_array = lines.reshape(-1, 4)
+    n = len(lines_array)
+    if n < 4:
+        print("Need at least 4 lines")
+    slopes = np.array([
+        compute_slope(x1, y1, x2, y2)
+        for x1, y1, x2, y2 in lines_array
+    ])
+    sorted_indices = np.argsort(slopes)
+    sorted_lines = lines_array[sorted_indices]
+    sorted_slopes = slopes[sorted_indices]
+    min_diff = float('inf')
+    best_group = None
+    for i in range(n - 3):
+        group = sorted_lines[i:i + 4]
+        group_slopes = sorted_slopes[i:i + 4]
+        diff = np.max(group_slopes) - np.min(group_slopes)
+        if diff < min_diff:
+            min_diff = diff
+            best_group = group
+    return best_group
+
+last_left_lines = []
+last_right_lines = []
+def Line_Detection(img):
+    global last_left_lines, last_right_lines
+    k=False
+    
+    height, width = img.shape[:2]
+    
+    
+    mask = np.zeros_like(img)
+    polygon = np.array([[ (110, 500), (730,500), (730 , 50), (110, 50 )]], np.int32)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)  # Apply Gaussian Blur to reduce noise
+    mask = np.zeros_like(blur) 
+    cv2.fillPoly(mask, [polygon], (255, 255, 255))
+  # Edge detection
+    edges = cv2.Canny(blur, 50, 150)
+    edges = cv2.bitwise_and(edges, mask)  # Apply the mask to the image
+    cv2.polylines(img, [polygon], isClosed=True, color=(0, 0, 0), thickness=2)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=100, maxLineGap=100)
+
+    left_lines, right_lines = [], []
+    
+    if lines is not None:
+        
+        #lines = find_the_4_lines_with_closest_slope(lines)
+        #lines_array = lines.reshape(-1, 1, 4)
+        #print(lines)
+        #print("-------------------------------")
+        
+        for line in lines:
+            
+            x1, y1, x2, y2 = line[0]
+            
+            slope=abs((y2-y1)//(x2-x1))
+            #arz = x2 - x1
+            if x1 < width // 2 and x2 < width // 2 and (slope>2):
+                left_lines.append(line)
+                
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            if x1 > width // 2 and x2 > width // 2 and (slope>2):
+                cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                right_lines.append(line)
+                
+        
+        
+        if len(left_lines)==0:
+            left_lines = last_left_lines
+        if len(right_lines)==0:
+            right_lines = last_right_lines
+        else:
+            last_right_lines=right_lines
+            last_left_lines=left_lines
+    else:
+        # Use last detected lines if no current ones are found
+        left_lines = last_left_lines
+        right_lines = last_right_lines
+
+    def average_line(lines):
+        
+        if not lines:
+            return None
+        x1_avg = sum(line[0][0] for line in lines) // len(lines)
+        y1_avg = sum(line[0][1] for line in lines) // len(lines)
+        x2_avg = sum(line[0][2] for line in lines) // len(lines)
+        y2_avg = sum(line[0][3] for line in lines) // len(lines)
+        return [[x1_avg, y1_avg, x2_avg, y2_avg]]
+
+    avg_left_line = average_line(left_lines)
+    avg_right_line = average_line(right_lines)
+
+    if avg_left_line:
+        x1, y1, x2, y2 = avg_left_line[0]
+        cv2.line(img, (x1, y1), (x2, y2), (255, 0, 0), 30)
+
+    if avg_right_line:
+        x1, y1, x2, y2 = avg_right_line[0]
+        cv2.line(img, (x1, y1), (x2, y2), (0, 0, 255), 30)
+    
+        #print(right_lines)
+        #print(left_lines )
+
+    # نقطه میانی مسیر
+    if avg_left_line and avg_right_line:
+        left_center = ((avg_left_line[0][0] + avg_left_line[0][2]) // 2, (avg_left_line[0][1] + avg_left_line[0][3]) // 2)
+        right_center = ((avg_right_line[0][0] + avg_right_line[0][2]) // 2, (avg_right_line[0][1] + avg_right_line[0][3]) // 2)
+        center_point = ((left_center[0] + right_center[0]) // 2, (left_center[1] + right_center[1]) // 2)
+    
+    elif avg_right_line:
+        #center_point = ((avg_right_line[0][0] + avg_right_line[0][2]) // 2, (avg_right_line[0][1] + avg_right_line[0][3]) // 2)
+        center_point = None
+        k=True
+    else:
+        center_point = None#-----------------------------------------------------
+    
+    if k :
+            servo_angle=30
+            #print("LK")
+            k=False
+            return servo_angle
+    
+
+    if center_point :
+        cv2.circle(img, center_point, 5, (255, 0, 255), 100)
+        
+        car_center_x = width // 2
+        #print(f"car center:{car_center_x}")
+        car_center_x =car_center_x
+        l=center_point[0]
+        #print(f"center_point : {center_point[0]}")
+        error = (l - car_center_x)
+        
+        #print(f"error: {error}")
+        
+        steering_angle = int(np.clip(pid_control(error), -100, 100))
+        #print(f'Steering Angle: {steering_angle}')
+        steering_angle = ((steering_angle*1.1)+110)
+        if steering_angle==0:
+           steering_angle = 50
+        else:
+            steering_angle=steering_angle/2
+            #if find_white_mean_x 
+            print(find_white_mean_x(img))
+            servo_angle = int(steering_angle)
+
+        #print(f'Steering Angle: {servo_angle}')
+        return servo_angle
+
+cap = cv2.VideoCapture(0)
+
+def detect_len(detect_corners):
+    x_top = int(detect_corners[0][0][0][0])
+    y_top = int(detect_corners[0][0][0][1])
+    x_down = int(detect_corners[0][0][3][0])
+    y_down = int(detect_corners[0][0][3][1])
+    
+    len_ = math.sqrt((x_down - x_top) ** 2 + (y_down - y_top) ** 2)
+    return int(len_)
+
+while True:
+    #image -> camera
+    image = picam2.capture_array()
+    frame = image
+    for point in src_points:
+        cv2.circle(image, tuple(point.astype(int)), 5, (0, 0, 255), -1)
+    cv2.polylines(image, [src_points.astype(int)], isClosed=True, color=(0, 255, 0), thickness=2)
+
+    servo_angle = 45
+    temp_angle = Line_Detection(frame)
+    if temp_angle is not None:
+        servo_angle = temp_angle
+        send_command(f"A{servo_angle}")
+        # تبدیل به grayscale
+    
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    
+    white_p= find_white_mean_x(frame)
+    print(f'-----count in polygon---{white_p}----')
+    
+    if(white_p>30000):
+        
+        print("Zebra crossing detected!")
+
+        send_command('S')
+        print("stop zebra")
+    #time.sleep(3)
+    
+    
+
+    
+    #------------------------------------------------------------------------
+    #frame2 -> webcam
+    ret2, frame2 = cap.read()
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    image = cv2.rotate(image, cv2.ROTATE_180)
+    image = reduce_local_brightness(image, threshold=1, gamma=1, kernel_size=10)
+    gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+    height, width, channels = frame2.shape
+    corners2, ids2, rejected2 = cv2.aruco.detectMarkers(gray2, aruco_dict, parameters=aruco_params)
+    len_dict = {}
+    
+    nearest_sign_tag= None
+    
+    if corners2 and len(corners2) > 0:
+        # print(len_dict)
+        for detect in ids2:
+            len_dict[detect[0]] = detect_len(corners2)
+            nearest_sign_tag = max(len_dict, key=len_dict.get)
+            #print(f"Nearest tag ID: {nearest_sign_tag}")
+            #print(ids[detect][0])
+            print(len_dict[max(len_dict,key=len_dict.get)])
+
+    if ids2 is not None:
+        cv2.aruco.drawDetectedMarkers(frame2, corners2, ids2)
+    if nearest_sign_tag is not None:
+        print(nearest_sign_tag)
+        if(nearest_sign_tag==5):# 5 = stop
+            motor_speed=0
+            print("stop sign detected")
+            send_command(str(motor_speed))
+        
+
+    #elif(nearest_sign_tag==1):
+        
+    #elif(nearest_sign_tag==2):
+        
+    elif(nearest_sign_tag==3):
+        #stop
+        send_command('S')
+        print("stop zebra")
+        time.sleep(3)
+        #left
+        send_command(f"A{100}")
+        motor_speed=96
+        
+        send_command(str(motor_speed))
+        
+        
+        
+        
+    #elif(nearest_sign_tag==4):
+        
+    #elif(nearest_sign_tag==5):
+        
+        
+
+    #--------------------------------------------------------
+
+    cv2.imshow('line detection', frame)
+    cv2.imshow('ArUco Detectio', frame2)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        move_command = 'S'
+        send_command(move_command)
+        time.sleep(2)
+        cv2.destroyAllWindows()
+        break
